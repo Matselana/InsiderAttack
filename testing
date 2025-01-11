@@ -1,0 +1,314 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.decomposition import PCA
+from sklearn.metrics import classification_report, accuracy_score
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.svm import OneClassSVM
+from sklearn.neighbors import LocalOutlierFactor
+from imblearn.over_sampling import SMOTE
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Define the directory path
+directory_path = r'C:\Users\sampu\.vscode\GettingStarted\r4.2\r4.2'
+
+# Load data
+logon_data = pd.read_csv(os.path.join(directory_path, 'logon.csv'))
+device_data = pd.read_csv(os.path.join(directory_path, 'device.csv'))
+email_data = pd.read_csv(os.path.join(directory_path, 'email.csv'))
+file_data = pd.read_csv(os.path.join(directory_path, 'file.csv'))
+
+# Merge DataFrames on the 'id' column
+combined_data = pd.merge(logon_data, device_data, on='id', how='left', suffixes=('', '_device'))
+combined_data = pd.merge(combined_data, email_data, on='id', how='left', suffixes=('', '_email'))
+combined_data = pd.merge(combined_data, file_data, on='id', how='left', suffixes=('', '_file'))
+
+# Display the first few rows of the combined DataFrame
+print("Combined Data:")
+print(combined_data.head())
+
+# Handling date features
+date_columns = ['date', 'date_device', 'date_email', 'date_file']
+for date_column in date_columns:
+    if date_column in combined_data.columns:
+        combined_data[date_column] = pd.to_datetime(combined_data[date_column], errors='coerce')
+        # Extract year, month, day, hour
+        combined_data[f'year_{date_column}'] = combined_data[date_column].dt.year
+        combined_data[f'month_{date_column}'] = combined_data[date_column].dt.month
+        combined_data[f'day_{date_column}'] = combined_data[date_column].dt.day
+        combined_data[f'hour_{date_column}'] = combined_data[date_column].dt.hour
+
+# Define business hours
+BUSINESS_START = 9  # 9 AM
+BUSINESS_END = 17   # 5 PM
+
+# Unusual login time detection
+if 'date' in combined_data.columns:
+    combined_data['login_hour'] = combined_data['date'].dt.hour
+    combined_data['unusual_login_time'] = combined_data['login_hour'].apply(
+        lambda x: 1 if x < BUSINESS_START or x >= BUSINESS_END else 0
+    )
+
+# Track number of unique devices a user logs in with
+if 'pc' in combined_data.columns:
+    device_counts = combined_data.groupby('user')['pc'].nunique().reset_index()
+    device_counts.columns = ['user', 'unique_device_count']
+    combined_data = combined_data.merge(device_counts, on='user', how='left')
+
+# Unusually high frequency of logins
+if 'date' in combined_data.columns:
+    combined_data['login_date'] = combined_data['date'].dt.date
+    daily_logins = combined_data.groupby(['user', 'login_date']).size().reset_index(name='daily_login_count')
+
+    login_stats = daily_logins.groupby('user')['daily_login_count'].agg(['mean', 'std']).reset_index()
+    login_stats.columns = ['user', 'mean_daily_logins', 'std_daily_logins']
+
+    combined_data = combined_data.merge(login_stats, on='user', how='left')
+    combined_data = combined_data.merge(daily_logins, on=['user', 'login_date'], how='left')
+    combined_data['high_login_frequency'] = combined_data.apply(
+        lambda row: 1 if row['daily_login_count'] > row['mean_daily_logins'] + 2 * row['std_daily_logins'] else 0,
+        axis=1
+    )
+
+# Employees logging on during weekends and outside of working hours
+if 'date' in combined_data.columns:
+    combined_data['is_weekend'] = combined_data['date'].dt.dayofweek >= 5
+    combined_data['weekend_login'] = combined_data['is_weekend'].astype(int)
+    combined_data['outside_working_hours'] = combined_data['unusual_login_time'].copy()
+
+# Handling user activity
+if 'activity' in combined_data.columns:
+    logon_counts = combined_data[combined_data['activity'] == 'Logon'].groupby('user').size()
+    logoff_counts = combined_data[combined_data['activity'] == 'Logoff'].groupby('user').size()
+
+    combined_data['total_logons'] = combined_data['user'].map(logon_counts).fillna(0).astype(int)
+    combined_data['total_logoffs'] = combined_data['user'].map(logoff_counts).fillna(0).astype(int)
+else:
+    print("Warning: 'activity' column not found. Skipping activity checks.")
+    combined_data['total_logons'] = 0
+    combined_data['total_logoffs'] = 0
+
+# Drop columns with all missing values
+combined_data.dropna(axis=1, how='all', inplace=True)
+
+# Impute missing values
+numeric_columns = combined_data.select_dtypes(include=['number']).columns
+numeric_imputer = SimpleImputer(strategy='median')
+combined_data[numeric_columns] = numeric_imputer.fit_transform(combined_data[numeric_columns])
+
+non_numeric_columns = combined_data.select_dtypes(include=['object']).columns
+combined_data[non_numeric_columns] = combined_data[non_numeric_columns].astype('category').apply(lambda x: x.cat.codes)
+
+# Feature selection
+features = ['user', 'unique_device_count', 'unusual_login_time', 
+            'total_logons', 'total_logoffs', 'high_login_frequency']
+X = combined_data[features].copy()  
+
+# Anomaly detection feature
+combined_data['anomaly_detection'] = (
+    (combined_data['unusual_login_time'] == 1) | 
+    (combined_data['unique_device_count'] > 1) | 
+    (combined_data['high_login_frequency'] == 1)
+).astype(int)  
+
+target_column = 'anomaly_detection'  
+y = combined_data[target_column].copy()
+
+# Data encoding
+le = LabelEncoder()
+X['user'] = X['user'].astype(str)  
+X['user'] = le.fit_transform(X['user']).astype(np.int64)  
+
+# Impute missing values for features
+imputer = SimpleImputer(strategy='mean')
+X_imputed = imputer.fit_transform(X)
+
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(X_imputed, y, test_size=0.4, random_state=42)
+
+# Apply PCA
+pca = PCA(n_components=0.95)  
+X_train_pca = pca.fit_transform(X_train)  
+X_test_pca = pca.transform(X_test)  
+
+# Train and evaluate Isolation Forest
+iforest = IsolationForest(contamination=0.05, random_state=42)
+iforest.fit(X_train_pca)
+
+y_train_pred_iforest = iforest.predict(X_train_pca)
+y_test_pred_iforest = iforest.predict(X_test_pca)
+
+y_train_pred_iforest = [1 if pred == -1 else 0 for pred in y_train_pred_iforest]
+y_test_pred_iforest = [1 if pred == -1 else 0 for pred in y_test_pred_iforest]
+
+print("Isolation Forest - Training Set Evaluation")
+print(classification_report(y_train, y_train_pred_iforest))
+print("Isolation Forest - Testing Set Evaluation")
+print(classification_report(y_test, y_test_pred_iforest))
+
+# Train and evaluate Random Forest
+rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
+rf_model.fit(X_train, y_train)
+
+y_train_pred_rf = rf_model.predict(X_train)
+y_test_pred_rf = rf_model.predict(X_test)
+
+print("Random Forest - Training Set Evaluation")
+print(classification_report(y_train, y_train_pred_rf))
+print("Random Forest - Testing Set Evaluation")
+print(classification_report(y_test, y_test_pred_rf))
+
+# Train and evaluate Local Outlier Factor
+lof = LocalOutlierFactor(n_neighbors=20)  
+y_train_lof_pred = lof.fit_predict(X_train_pca)
+y_train_lof_pred_binary = (y_train_lof_pred == -1).astype(int)
+
+print("Local Outlier Factor - Training Set Evaluation")
+print(classification_report(y_train, y_train_lof_pred_binary, zero_division=0))
+
+y_test_lof_pred = lof.fit_predict(X_test_pca)
+y_test_lof_pred_binary = (y_test_lof_pred == -1).astype(int)
+
+print("Local Outlier Factor - Testing Set Evaluation")
+print(classification_report(y_test, y_test_lof_pred_binary, zero_division=0))
+
+# Train One-Class SVM
+ocsvm = OneClassSVM(kernel='rbf', gamma='scale', nu=0.05)  
+ocsvm.fit(X_train[y_train == 0])
+
+y_pred = ocsvm.predict(X_test)
+y_pred_binary = (y_pred == -1).astype(int)
+
+print("One-Class SVM Classification Report:")
+print(classification_report(y_test, y_pred_binary, zero_division=0))
+accuracy_ocsvm = accuracy_score(y_test, y_pred_binary)
+print(f"Accuracy of One-Class SVM: {accuracy_ocsvm:.2f}")
+
+# Apply SMOTE for oversampling the minority class
+smote = SMOTE(random_state=42)
+X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+
+print("Original class distribution:", y_train.value_counts())
+print("Resampled class distribution:", pd.Series(y_train_resampled).value_counts())
+
+# Train Isolation Forest with SMOTE data
+iforest = IsolationForest(random_state=42)
+iforest.fit(X_train_resampled)
+
+y_test_pred_iforest = iforest.predict(X_test)
+y_test_pred_iforest = [1 if x == -1 else 0 for x in y_test_pred_iforest]
+
+print(classification_report(y_test, y_test_pred_iforest, target_names=["Normal", "Anomaly"]))
+
+
+
+
+#d
+# Separate features and target variable
+X = combined_data.drop(columns=['anomaly_detection'])  # Adjust based on your actual feature columns
+y = combined_data['anomaly_detection']
+
+# Convert datetime columns to numeric (e.g., Unix timestamp)
+for col in X.select_dtypes(include=[np.datetime64]).columns:
+    X[col] = X[col].astype(np.int64) // 10**9  # Convert to seconds since epoch
+
+# Ensure X contains only numeric data
+X = X.select_dtypes(include=[np.number])
+
+# Split the dataset into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.4, random_state=42, stratify=y)
+
+# Initialize One-Class SVM
+ocsvm = OneClassSVM(kernel='rbf', gamma='scale', nu=0.05)  # You can adjust nu and kernel as needed
+
+# Fit the model only on the normal class
+ocsvm.fit(X_train[y_train == 0])
+
+# Predict on the test set
+y_pred = ocsvm.predict(X_test)
+
+# Convert predictions: -1 for anomaly, 1 for normal
+y_pred_binary = (y_pred == -1).astype(int)
+
+# Evaluation
+print("One-Class SVM Classification Report:")
+print(classification_report(y_test, y_pred_binary, zero_division=0))
+accuracy_ocsvm = accuracy_score(y_test, y_pred_binary)
+print(f"Accuracy of One-Class SVM: {accuracy_ocsvm:.2f}")
+
+
+
+
+
+
+# Dummy predictions and true labels for illustration
+# Replace these with your actual predictions and true labels
+y_test = np.random.randint(0, 2, size=1000)  # True labels
+y_test_pred_iforest = np.random.randint(0, 2, size=1000)  # Isolation Forest predictions
+y_test_pred_lof = np.random.randint(0, 2, size=1000)  # LOF predictions
+y_test_pred_ocsvm = np.random.randint(0, 2, size=1000)  # OCSVM predictions
+
+# Get classification reports for each model
+report_iforest = classification_report(y_test, y_test_pred_iforest, output_dict=True)
+report_lof = classification_report(y_test, y_test_pred_lof, output_dict=True)
+report_ocsvm = classification_report(y_test, y_test_pred_ocsvm, output_dict=True)
+
+
+# Function to extract metrics
+def extract_metrics(report):
+    precision, recall, f1_score, labels = [], [], [], []
+    for label, metrics in report.items():
+        if isinstance(metrics, dict) and label not in ['accuracy', 'macro avg', 'weighted avg']:
+            labels.append(label)
+            precision.append(metrics['precision'])
+            recall.append(metrics['recall'])
+            f1_score.append(metrics['f1-score'])
+    return precision, recall, f1_score, labels
+
+# Extract metrics for each model
+precision_iforest, recall_iforest, f1_iforest, labels_iforest = extract_metrics(report_iforest)
+precision_lof, recall_lof, f1_lof, labels_lof = extract_metrics(report_lof)
+precision_ocsvm, recall_ocsvm, f1_ocsvm, labels_ocsvm = extract_metrics(report_ocsvm)
+
+# Plotting
+fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+
+def plot_metrics(ax, precision, recall, f1_score, labels, title):
+    x = np.arange(len(labels))  # the label locations
+    bar_width = 0.25
+
+    ax.bar(x - bar_width, precision, width=bar_width, label='Precision', color='lightblue')
+    ax.bar(x, recall, width=bar_width, label='Recall', color='lightgreen')
+    ax.bar(x + bar_width, f1_score, width=bar_width, label='F1 Score', color='salmon')
+
+    ax.set_xlabel('Classes')
+    ax.set_ylabel('Scores')
+    ax.set_title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.legend()
+
+    # Function to attach a label to each bar
+    def add_value_labels(bars):
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.2f}', 
+                        xy=(bar.get_x() + bar.get_width() / 2, height), 
+                        xytext=(0, 3),  
+                        textcoords="offset points", 
+                        ha='center', va='bottom')
+
+    # Add labels to bars
+    add_value_labels(ax.patches)
+
+# Plot each model's metrics
+plot_metrics(axs[0], precision_iforest, recall_iforest, f1_iforest, labels_iforest, 'Isolation Forest Metrics')
+plot_metrics(axs[1], precision_lof, recall_lof, f1_lof, labels_lof, 'Local Outlier Factor Metrics')
+plot_metrics(axs[2], precision_ocsvm, recall_ocsvm, f1_ocsvm, labels_ocsvm, 'One-Class SVM Metrics')
+
+plt.tight_layout()
+plt.show()
